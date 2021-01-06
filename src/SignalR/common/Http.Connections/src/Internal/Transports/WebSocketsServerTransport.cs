@@ -201,7 +201,7 @@ namespace Microsoft.AspNetCore.Http.Connections.Internal.Transports
 
         private async Task StartSending(WebSocket socket)
         {
-            Exception error = null;
+            Exception? error = null;
 
             try
             {
@@ -231,7 +231,8 @@ namespace Microsoft.AspNetCore.Http.Connections.Internal.Transports
 
                                 if (WebSocketCanSend(socket))
                                 {
-                                    await socket.SendAsync(buffer, webSocketMessageType);
+                                    _connection.StartSendCancellation();
+                                    await socket.SendAsync(buffer, webSocketMessageType, _connection.SendingToken);
                                 }
                                 else
                                 {
@@ -254,6 +255,7 @@ namespace Microsoft.AspNetCore.Http.Connections.Internal.Transports
                     }
                     finally
                     {
+                        _connection.StopSendCancellation();
                         _application.Input.AdvanceTo(buffer.End);
                     }
                 }

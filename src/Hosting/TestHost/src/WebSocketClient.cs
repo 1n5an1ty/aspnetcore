@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.WebSockets;
@@ -15,6 +16,9 @@ using Microsoft.Net.Http.Headers;
 
 namespace Microsoft.AspNetCore.TestHost
 {
+    /// <summary>
+    /// Provides a client for connecting over WebSockets to a test server.
+    /// </summary>
     public class WebSocketClient
     {
         private readonly ApplicationWrapper _application;
@@ -25,33 +29,36 @@ namespace Microsoft.AspNetCore.TestHost
             _application = application ?? throw new ArgumentNullException(nameof(application));
 
             // PathString.StartsWithSegments that we use below requires the base path to not end in a slash.
-            if (pathBase.HasValue && pathBase.Value.EndsWith("/"))
+            if (pathBase.HasValue && pathBase.Value.EndsWith('/'))
             {
-                pathBase = new PathString(pathBase.Value.Substring(0, pathBase.Value.Length - 1));
+                pathBase = new PathString(pathBase.Value[..^1]); // All but the last character.
             }
             _pathBase = pathBase;
 
             SubProtocols = new List<string>();
         }
 
-        public IList<string> SubProtocols
-        {
-            get;
-            private set;
-        }
+        /// <summary>
+        /// Gets the list of WebSocket subprotocols that are established in the initial handshake.
+        /// </summary>
+        public IList<string> SubProtocols { get; }
 
-        public Action<HttpRequest> ConfigureRequest
-        {
-            get;
-            set;
-        }
+        /// <summary>
+        /// Gets or sets the handler used to configure the outgoing request to the WebSocket endpoint.
+        /// </summary>
+        public Action<HttpRequest>? ConfigureRequest { get; set; }
 
         internal bool AllowSynchronousIO { get; set; }
         internal bool PreserveExecutionContext { get; set; }
 
+        /// <summary>
+        /// Establishes a WebSocket connection to an endpoint.
+        /// </summary>
+        /// <param name="uri">The <see cref="Uri" /> of the endpoint.</param>
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> used to terminate the connection.</param>
         public async Task<WebSocket> ConnectAsync(Uri uri, CancellationToken cancellationToken)
         {
-            WebSocketFeature webSocketFeature = null;
+            WebSocketFeature? webSocketFeature = null;
             var contextBuilder = new HttpContextBuilder(_application, AllowSynchronousIO, PreserveExecutionContext);
             contextBuilder.Configure((context, reader) =>
             {
@@ -98,6 +105,8 @@ namespace Microsoft.AspNetCore.TestHost
             {
                 throw new InvalidOperationException("Incomplete handshake, status code: " + httpContext.Response.StatusCode);
             }
+
+            Debug.Assert(webSocketFeature != null);
             if (webSocketFeature.ClientWebSocket == null)
             {
                 throw new InvalidOperationException("Incomplete handshake");
@@ -124,9 +133,9 @@ namespace Microsoft.AspNetCore.TestHost
 
             bool IHttpWebSocketFeature.IsWebSocketRequest => true;
 
-            public WebSocket ClientWebSocket { get; private set; }
+            public WebSocket? ClientWebSocket { get; private set; }
 
-            public WebSocket ServerWebSocket { get; private set; }
+            public WebSocket? ServerWebSocket { get; private set; }
 
             async Task<WebSocket> IHttpWebSocketFeature.AcceptAsync(WebSocketAcceptContext context)
             {

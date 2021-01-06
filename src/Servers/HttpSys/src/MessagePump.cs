@@ -3,7 +3,7 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics.Contracts;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,11 +22,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
         private readonly ILogger _logger;
         private readonly HttpSysOptions _options;
 
-        private IHttpApplication<object> _application;
-
         private int _maxAccepts;
         private int _acceptorCounts;
-        private Action<object> _processRequest;
 
         private volatile int _stopping;
         private int _outstandingRequests;
@@ -51,22 +48,29 @@ namespace Microsoft.AspNetCore.Server.HttpSys
 
             if (_options.Authentication.Schemes != AuthenticationSchemes.None)
             {
-                authentication.AddScheme(new AuthenticationScheme(HttpSysDefaults.AuthenticationScheme, displayName: null, handlerType: typeof(AuthenticationHandler)));
+                authentication.AddScheme(new AuthenticationScheme(HttpSysDefaults.AuthenticationScheme, displayName: _options.Authentication.AuthenticationDisplayName, handlerType: typeof(AuthenticationHandler)));
             }
 
             Features = new FeatureCollection();
             _serverAddresses = new ServerAddressesFeature();
             Features.Set<IServerAddressesFeature>(_serverAddresses);
 
-            _processRequest = new Action<object>(ProcessRequestAsync);
+            if (HttpApi.IsFeatureSupported(HttpApiTypes.HTTP_FEATURE_ID.HttpFeatureDelegateEx))
+            {
+                var delegationProperty = new ServerDelegationPropertyFeature(Listener.RequestQueue, _logger);
+                Features.Set<IServerDelegationFeature>(delegationProperty);
+            }
+
             _maxAccepts = _options.MaxAccepts;
         }
 
         internal HttpSysListener Listener { get; }
 
+        internal IRequestContextFactory RequestContextFactory { get; set; }
+
         public IFeatureCollection Features { get; }
 
-        private bool Stopping => _stopping == 1;
+        internal bool Stopping => _stopping == 1;
 
         public Task StartAsync<TContext>(IHttpApplication<TContext> application, CancellationToken cancellationToken)
         {
@@ -83,7 +87,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
             {
                 if (_options.UrlPrefixes.Count > 0)
                 {
-                    _logger.LogWarning($"Overriding endpoints added to {nameof(HttpSysOptions.UrlPrefixes)} since {nameof(IServerAddressesFeature.PreferHostingUrls)} is set to true." +
+                    _logger.LogWarning(LoggerEventIds.ClearedPrefixes, $"Overriding endpoints added to {nameof(HttpSysOptions.UrlPrefixes)} since {nameof(IServerAddressesFeature.PreferHostingUrls)} is set to true." +
                         $" Binding to address(es) '{string.Join(", ", _serverAddresses.Addresses)}' instead. ");
 
                     Listener.Options.UrlPrefixes.Clear();
@@ -95,7 +99,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
             {
                 if (hostingUrlsPresent)
                 {
-                    _logger.LogWarning($"Overriding address(es) '{string.Join(", ", _serverAddresses.Addresses)}'. " +
+                    _logger.LogWarning(LoggerEventIds.ClearedAddresses, $"Overriding address(es) '{string.Join(", ", _serverAddresses.Addresses)}'. " +
                         $"Binding to endpoints added to {nameof(HttpSysOptions.UrlPrefixes)} instead.");
 
                     _serverAddresses.Addresses.Clear();
@@ -108,18 +112,18 @@ namespace Microsoft.AspNetCore.Server.HttpSys
             }
             else if (Listener.RequestQueue.Created)
             {
-                _logger.LogDebug($"No listening endpoints were configured. Binding to {Constants.DefaultServerAddress} by default.");
+                _logger.LogDebug(LoggerEventIds.BindingToDefault, $"No listening endpoints were configured. Binding to {Constants.DefaultServerAddress} by default.");
 
                 Listener.Options.UrlPrefixes.Add(Constants.DefaultServerAddress);
             }
             // else // Attaching to an existing queue, don't add a default.
 
-            // Can't call Start twice
-            Contract.Assert(_application == null);
+            // Can't start twice
+            Debug.Assert(RequestContextFactory == null, "Start called twice!");
 
-            Contract.Assert(application != null);
+            Debug.Assert(application != null);
 
-            _application = new ApplicationWrapper<TContext>(application);
+            RequestContextFactory = new ApplicationRequestContextFactory<TContext>(application, this);
 
             Listener.Start();
 
@@ -130,7 +134,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
                 _serverAddresses.Addresses.Add(prefix.FullPrefix);
             }
 
-            ActivateRequestProcessingLimits();
+            // Dispatch to get off the SynchronizationContext and use UnsafeQueueUserWorkItem to avoid capturing the ExecutionContext
+            ThreadPool.UnsafeQueueUserWorkItem(state => state.ActivateRequestProcessingLimits(), this, preferLocal: false);
 
             return Task.CompletedTask;
         }
@@ -139,7 +144,8 @@ namespace Microsoft.AspNetCore.Server.HttpSys
         {
             for (int i = _acceptorCounts; i < _maxAccepts; i++)
             {
-                ProcessRequestsWorker();
+                // Ignore the result
+                _ = ProcessRequestsWorker();
             }
         }
 
@@ -151,12 +157,30 @@ namespace Microsoft.AspNetCore.Server.HttpSys
             }
         }
 
+        internal int IncrementOutstandingRequest()
+        {
+            return Interlocked.Increment(ref _outstandingRequests);
+        }
+
+        internal int DecrementOutstandingRequest()
+        {
+            return Interlocked.Decrement(ref _outstandingRequests);
+        }
+
+        internal void SetShutdownSignal()
+        {
+            _shutdownSignal.TrySetResult(null);
+        }
+
         // The message pump.
         // When we start listening for the next request on one thread, we may need to be sure that the
         // completion continues on another thread as to not block the current request processing.
         // The awaits will manage stack depth for us.
-        private async void ProcessRequestsWorker()
+        private async Task ProcessRequestsWorker()
         {
+            // Allocate and accept context per loop and reuse it for all accepts
+            using var acceptContext = new AsyncAcceptContext(Listener, RequestContextFactory);
+
             int workerIndex = Interlocked.Increment(ref _acceptorCounts);
             while (!Stopping && workerIndex <= _maxAccepts)
             {
@@ -164,106 +188,43 @@ namespace Microsoft.AspNetCore.Server.HttpSys
                 RequestContext requestContext;
                 try
                 {
-                    requestContext = await Listener.AcceptAsync().SupressContext();
+                    requestContext = await Listener.AcceptAsync(acceptContext);
+
+                    if (!Listener.ValidateRequest(requestContext))
+                    {
+                        // Dispose the request
+                        requestContext.ReleasePins();
+                        requestContext.Dispose();
+
+                        // If either of these is false then a response has already been sent to the client, so we can accept the next request
+                        continue;
+                    }
                 }
                 catch (Exception exception)
                 {
-                    Contract.Assert(Stopping);
+                    Debug.Assert(Stopping);
                     if (Stopping)
                     {
-                        _logger.LogDebug(0, exception, "ListenForNextRequestAsync-Stopping");
+                        _logger.LogDebug(LoggerEventIds.AcceptErrorStopping, exception, "Failed to accept a request, the server is stopping.");
                     }
                     else
                     {
-                        _logger.LogError(0, exception, "ListenForNextRequestAsync");
+                        _logger.LogError(LoggerEventIds.AcceptError, exception, "Failed to accept a request.");
                     }
                     continue;
                 }
                 try
                 {
-                    Task ignored = Task.Factory.StartNew(_processRequest, requestContext);
+                    ThreadPool.UnsafeQueueUserWorkItem(requestContext, preferLocal: false);
                 }
                 catch (Exception ex)
                 {
                     // Request processing failed to be queued in threadpool
                     // Log the error message, release throttle and move on
-                    _logger.LogError(0, ex, "ProcessRequestAsync");
+                    _logger.LogError(LoggerEventIds.RequestListenerProcessError, ex, "ProcessRequestAsync");
                 }
             }
             Interlocked.Decrement(ref _acceptorCounts);
-        }
-
-        private async void ProcessRequestAsync(object requestContextObj)
-        {
-            var requestContext = requestContextObj as RequestContext;
-            try
-            {
-                if (Stopping)
-                {
-                    SetFatalResponse(requestContext, 503);
-                    return;
-                }
-
-                object context = null;
-                Interlocked.Increment(ref _outstandingRequests);
-                try
-                {
-                    var featureContext = new FeatureContext(requestContext);
-                    context = _application.CreateContext(featureContext.Features);
-                    try
-                    {
-                        await _application.ProcessRequestAsync(context).SupressContext();
-                        await featureContext.CompleteAsync();
-                    }
-                    finally
-                    {
-                        await featureContext.OnCompleted();
-                    }
-                    _application.DisposeContext(context, null);
-                    requestContext.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(0, ex, "ProcessRequestAsync");
-                    _application.DisposeContext(context, ex);
-                    if (requestContext.Response.HasStarted)
-                    {
-                        // HTTP/2 INTERNAL_ERROR = 0x2 https://tools.ietf.org/html/rfc7540#section-7
-                        // Otherwise the default is Cancel = 0x8.
-                        requestContext.SetResetCode(2);
-                        requestContext.Abort();
-                    }
-                    else
-                    {
-                        // We haven't sent a response yet, try to send a 500 Internal Server Error
-                        requestContext.Response.Headers.IsReadOnly = false;
-                        requestContext.Response.Trailers.IsReadOnly = false;
-                        requestContext.Response.Headers.Clear();
-                        requestContext.Response.Trailers.Clear();
-                        SetFatalResponse(requestContext, 500);
-                    }
-                }
-                finally
-                {
-                    if (Interlocked.Decrement(ref _outstandingRequests) == 0 && Stopping)
-                    {
-                        _logger.LogInformation("All requests drained.");
-                        _shutdownSignal.TrySetResult(0);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(0, ex, "ProcessRequestAsync");
-                requestContext.Abort();
-            }
-        }
-
-        private static void SetFatalResponse(RequestContext context, int status)
-        {
-            context.Response.StatusCode = status;
-            context.Response.ContentLength = 0;
-            context.Dispose();
         }
 
         public Task StopAsync(CancellationToken cancellationToken)
@@ -274,7 +235,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
                 {
                     if (Interlocked.Exchange(ref _shutdownSignalCompleted, 1) == 0)
                     {
-                        _logger.LogInformation("Canceled, terminating " + _outstandingRequests + " request(s).");
+                        _logger.LogInformation(LoggerEventIds.StopCancelled, "Canceled, terminating " + _outstandingRequests + " request(s).");
                         _shutdownSignal.TrySetResult(null);
                     }
                 });
@@ -292,7 +253,7 @@ namespace Microsoft.AspNetCore.Server.HttpSys
                 // Wait for active requests to drain
                 if (_outstandingRequests > 0)
                 {
-                    _logger.LogInformation("Stopping, waiting for " + _outstandingRequests + " request(s) to drain.");
+                    _logger.LogInformation(LoggerEventIds.WaitingForRequestsToDrain, "Stopping, waiting for " + _outstandingRequests + " request(s) to drain.");
                     RegisterCancelation();
                 }
                 else
@@ -314,31 +275,6 @@ namespace Microsoft.AspNetCore.Server.HttpSys
             _shutdownSignal.TrySetResult(null);
 
             Listener.Dispose();
-        }
-
-        private class ApplicationWrapper<TContext> : IHttpApplication<object>
-        {
-            private readonly IHttpApplication<TContext> _application;
-
-            public ApplicationWrapper(IHttpApplication<TContext> application)
-            {
-                _application = application;
-            }
-
-            public object CreateContext(IFeatureCollection contextFeatures)
-            {
-                return _application.CreateContext(contextFeatures);
-            }
-
-            public void DisposeContext(object context, Exception exception)
-            {
-                _application.DisposeContext((TContext)context, exception);
-            }
-
-            public Task ProcessRequestAsync(object context)
-            {
-                return _application.ProcessRequestAsync((TContext)context);
-            }
         }
     }
 }

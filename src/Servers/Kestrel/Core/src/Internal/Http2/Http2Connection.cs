@@ -8,13 +8,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
-using System.Net.Http;
 using System.Net.Http.HPack;
 using System.Runtime.CompilerServices;
 using System.Security.Authentication;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Net.Http;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -23,7 +22,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2.FlowControl;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure;
 using Microsoft.Extensions.Logging;
-using Microsoft.Net.Http.Headers;
+using Microsoft.AspNetCore.Internal;
 
 namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 {
@@ -37,18 +36,18 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         private readonly HttpConnectionContext _context;
         private readonly Http2FrameWriter _frameWriter;
         private readonly Pipe _input;
-        private Task _inputTask;
+        private readonly Task _inputTask;
         private readonly int _minAllocBufferSize;
         private readonly HPackDecoder _hpackDecoder;
         private readonly InputFlowControl _inputFlowControl;
-        private readonly OutputFlowControl _outputFlowControl = new OutputFlowControl(Http2PeerSettings.DefaultInitialWindowSize);
+        private readonly OutputFlowControl _outputFlowControl = new OutputFlowControl(new MultipleAwaitableProvider(), Http2PeerSettings.DefaultInitialWindowSize);
 
         private readonly Http2PeerSettings _serverSettings = new Http2PeerSettings();
         private readonly Http2PeerSettings _clientSettings = new Http2PeerSettings();
 
         private readonly Http2Frame _incomingFrame = new Http2Frame();
 
-        private Http2Stream _currentHeadersStream;
+        private Http2Stream? _currentHeadersStream;
         private RequestHeaderParsingState _requestHeaderParsingState;
         private PseudoHeaderFields _parsedPseudoHeaderFields;
         private Http2HeadersFrameFlags _headerFlags;
@@ -57,7 +56,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         private int _highestOpenedStreamId;
         private bool _gracefulCloseStarted;
 
-        private readonly Dictionary<int, Http2Stream> _streams = new Dictionary<int, Http2Stream>();
         private int _clientActiveStreamCount = 0;
         private int _serverActiveStreamCount = 0;
 
@@ -67,12 +65,28 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         private int _gracefulCloseInitiator;
         private int _isClosed;
 
+        // Internal for testing
+        internal readonly Http2KeepAlive? _keepAlive;
+        internal readonly Dictionary<int, Http2Stream> _streams = new Dictionary<int, Http2Stream>();
+        internal Http2StreamStack StreamPool;
+        // Max tracked streams is double max concurrent streams.
+        // If a small MaxConcurrentStreams value is configured then still track at least to 100 streams
+        // to support clients that send a burst of streams while the connection is being established.
+        internal uint MaxTrackedStreams => Math.Max(_serverSettings.MaxConcurrentStreams * 2, 100);
+
+        internal const int InitialStreamPoolSize = 5;
+        internal const int MaxStreamPoolSize = 100;
+        internal const long StreamPoolExpiryTicks = TimeSpan.TicksPerSecond * 5;
+
         public Http2Connection(HttpConnectionContext context)
         {
             var httpLimits = context.ServiceContext.ServerOptions.Limits;
             var http2Limits = httpLimits.Http2;
 
             _context = context;
+
+            // Capture the ExecutionContext before dispatching HTTP/2 middleware. Will be restored by streams when processing request
+            _context.InitialExecutionContext = ExecutionContext.Capture();
 
             _frameWriter = new Http2FrameWriter(
                 context.Transport.Output,
@@ -83,7 +97,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 httpLimits.MinResponseDataRate,
                 context.ConnectionId,
                 context.MemoryPool,
-                context.ServiceContext.Log);
+                context.ServiceContext);
 
             var inputOptions = new PipeOptions(pool: context.MemoryPool,
                 readerScheduler: context.ServiceContext.Scheduler,
@@ -101,11 +115,23 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             var connectionWindow = (uint)http2Limits.InitialConnectionWindowSize;
             _inputFlowControl = new InputFlowControl(connectionWindow, connectionWindow / 2);
 
+            if (http2Limits.KeepAlivePingDelay != TimeSpan.MaxValue)
+            {
+                _keepAlive = new Http2KeepAlive(
+                    http2Limits.KeepAlivePingDelay,
+                    http2Limits.KeepAlivePingTimeout,
+                    context.ServiceContext.SystemClock);
+            }
+
             _serverSettings.MaxConcurrentStreams = (uint)http2Limits.MaxStreamsPerConnection;
             _serverSettings.MaxFrameSize = (uint)http2Limits.MaxFrameSize;
             _serverSettings.HeaderTableSize = (uint)http2Limits.HeaderTableSize;
             _serverSettings.MaxHeaderListSize = (uint)httpLimits.MaxRequestHeadersTotalSize;
             _serverSettings.InitialWindowSize = (uint)http2Limits.InitialStreamWindowSize;
+
+            // Start pool off at a smaller size if the max number of streams is less than the InitialStreamPoolSize
+            StreamPool = new Http2StreamStack(Math.Min(InitialStreamPoolSize, http2Limits.MaxStreamsPerConnection));
+
             _inputTask = ReadInputAsync();
         }
 
@@ -142,12 +168,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         public void HandleRequestHeadersTimeout()
         {
-            Log.ConnectionBadRequest(ConnectionId, BadHttpRequestException.GetException(RequestRejectionReason.RequestHeadersTimeout));
+            Log.ConnectionBadRequest(ConnectionId, KestrelBadHttpRequestException.GetException(RequestRejectionReason.RequestHeadersTimeout));
             Abort(new ConnectionAbortedException(CoreStrings.BadRequest_RequestHeadersTimeout));
         }
 
         public void HandleReadDataRateTimeout()
         {
+            Debug.Assert(Limits.MinRequestBodyDataRate != null);
+
             Log.RequestBodyMinimumDataRateNotSatisfied(ConnectionId, null, Limits.MinRequestBodyDataRate.BytesPerSecond);
             Abort(new ConnectionAbortedException(CoreStrings.BadRequest_RequestBodyTimeout));
         }
@@ -162,9 +190,9 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
         }
 
-        public async Task ProcessRequestsAsync<TContext>(IHttpApplication<TContext> application)
+        public async Task ProcessRequestsAsync<TContext>(IHttpApplication<TContext> application) where TContext : notnull
         {
-            Exception error = null;
+            Exception? error = null;
             var errorCode = Http2ErrorCode.NO_ERROR;
 
             try
@@ -200,26 +228,60 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     // Call UpdateCompletedStreams() prior to frame processing in order to remove any streams that have exceeded their drain timeouts.
                     UpdateCompletedStreams();
 
+                    if (result.IsCanceled)
+                    {
+                        // Heartbeat will cancel ReadAsync and trigger expiring unused streams from pool.
+                        StreamPool.RemoveExpired(SystemClock.UtcNowTicks);
+                    }
+
                     try
                     {
+                        bool frameReceived = false;
                         while (Http2FrameReader.TryReadFrame(ref buffer, _incomingFrame, _serverSettings.MaxFrameSize, out var framePayload))
                         {
+                            frameReceived = true;
                             Log.Http2FrameReceived(ConnectionId, _incomingFrame);
-                            await ProcessFrameAsync(application, framePayload);
+
+                            try
+                            {
+                                await ProcessFrameAsync(application, framePayload);
+                            }
+                            catch (Http2StreamErrorException ex)
+                            {
+                                Log.Http2StreamError(ConnectionId, ex);
+                                // The client doesn't know this error is coming, allow draining additional frames for now.
+                                AbortStream(_incomingFrame.StreamId, new IOException(ex.Message, ex));
+
+                                await _frameWriter.WriteRstStreamAsync(ex.StreamId, ex.ErrorCode);
+
+                                // Resume reading frames after aborting this HTTP/2 stream.
+                                // This is important because additional frames could be
+                                // in the current buffer. We don't want to delay reading
+                                // them until the next incoming read/heartbeat.
+                            }
                         }
 
                         if (result.IsCompleted)
                         {
                             return;
                         }
-                    }
-                    catch (Http2StreamErrorException ex)
-                    {
-                        Log.Http2StreamError(ConnectionId, ex);
-                        // The client doesn't know this error is coming, allow draining additional frames for now.
-                        AbortStream(_incomingFrame.StreamId, new IOException(ex.Message, ex));
 
-                        await _frameWriter.WriteRstStreamAsync(ex.StreamId, ex.ErrorCode);
+                        if (_keepAlive != null)
+                        {
+                            // Note that the keep alive uses a complete frame being received to reset state.
+                            // Some other keep alive implementations use any bytes being received to reset state.
+                            var state = _keepAlive.ProcessKeepAlive(frameReceived);
+                            if (state == KeepAliveState.SendPing)
+                            {
+                                await _frameWriter.WritePingAsync(Http2PingFrameFlags.NONE, Http2KeepAlive.PingPayload);
+                            }
+                            else if (state == KeepAliveState.Timeout)
+                            {
+                                // There isn't a good error code to return with the GOAWAY.
+                                // NO_ERROR isn't a good choice because it indicates the connection is gracefully shutting down.
+                                throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorKeepAliveTimeout, Http2ErrorCode.INTERNAL_ERROR);
+                            }
+                        }
                     }
                     finally
                     {
@@ -257,6 +319,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
             catch (HPackDecodingException ex)
             {
+                Debug.Assert(_currentHeadersStream != null);
+
                 Log.HPackDecodingError(ConnectionId, _currentHeadersStream.StreamId, ex);
                 error = ex;
                 errorCode = Http2ErrorCode.COMPRESSION_ERROR;
@@ -270,7 +334,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             finally
             {
                 var connectionError = error as ConnectionAbortedException
-                    ?? new ConnectionAbortedException(CoreStrings.Http2ConnectionFaulted, error);
+                    ?? new ConnectionAbortedException(CoreStrings.Http2ConnectionFaulted, error!);
 
                 try
                 {
@@ -294,6 +358,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     {
                         await _streamCompletionAwaitable;
                         UpdateCompletedStreams();
+                    }
+
+                    while (StreamPool.TryPop(out var pooledStream))
+                    {
+                        pooledStream.Dispose();
                     }
 
                     // This cancels keep-alive and request header timeouts, but not the response drain timeout.
@@ -390,7 +459,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             return true;
         }
 
-        private Task ProcessFrameAsync<TContext>(IHttpApplication<TContext> application, in ReadOnlySequence<byte> payload)
+        private Task ProcessFrameAsync<TContext>(IHttpApplication<TContext> application, in ReadOnlySequence<byte> payload) where TContext : notnull
         {
             // http://httpwg.org/specs/rfc7540.html#rfc.section.5.1.1
             // Streams initiated by a client MUST use odd-numbered stream identifiers; ...
@@ -473,7 +542,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             throw new Http2ConnectionErrorException(CoreStrings.FormatHttp2ErrorStreamClosed(_incomingFrame.Type, _incomingFrame.StreamId), Http2ErrorCode.STREAM_CLOSED);
         }
 
-        private Task ProcessHeadersFrameAsync<TContext>(IHttpApplication<TContext> application, in ReadOnlySequence<byte> payload)
+        private Task ProcessHeadersFrameAsync<TContext>(IHttpApplication<TContext> application, in ReadOnlySequence<byte> payload) where TContext : notnull
         {
             if (_currentHeadersStream != null)
             {
@@ -554,29 +623,63 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 }
 
                 // Start a new stream
-                _currentHeadersStream = new Http2Stream<TContext>(application, new Http2StreamContext
-                {
-                    ConnectionId = ConnectionId,
-                    StreamId = _incomingFrame.StreamId,
-                    ServiceContext = _context.ServiceContext,
-                    ConnectionFeatures = _context.ConnectionFeatures,
-                    MemoryPool = _context.MemoryPool,
-                    LocalEndPoint = _context.LocalEndPoint,
-                    RemoteEndPoint = _context.RemoteEndPoint,
-                    StreamLifetimeHandler = this,
-                    ClientPeerSettings = _clientSettings,
-                    ServerPeerSettings = _serverSettings,
-                    FrameWriter = _frameWriter,
-                    ConnectionInputFlowControl = _inputFlowControl,
-                    ConnectionOutputFlowControl = _outputFlowControl,
-                    TimeoutControl = TimeoutControl,
-                });
+                _currentHeadersStream = GetStream(application);
 
-                _currentHeadersStream.Reset();
                 _headerFlags = _incomingFrame.HeadersFlags;
 
                 var headersPayload = payload.Slice(0, _incomingFrame.HeadersPayloadLength); // Minus padding
                 return DecodeHeadersAsync(_incomingFrame.HeadersEndHeaders, headersPayload);
+            }
+        }
+
+        private Http2Stream GetStream<TContext>(IHttpApplication<TContext> application) where TContext : notnull
+        {
+            if (StreamPool.TryPop(out var stream))
+            {
+                stream.InitializeWithExistingContext(_incomingFrame.StreamId);
+                return stream;
+            }
+
+            return new Http2Stream<TContext>(
+                application,
+                CreateHttp2StreamContext());
+        }
+
+        private Http2StreamContext CreateHttp2StreamContext()
+        {
+            var streamContext = new Http2StreamContext(
+                ConnectionId,
+                protocols: default,
+                _context.ServiceContext,
+                _context.ConnectionFeatures,
+                _context.MemoryPool,
+                _context.LocalEndPoint,
+                _context.RemoteEndPoint,
+                _incomingFrame.StreamId,
+                streamLifetimeHandler: this,
+                _clientSettings,
+                _serverSettings,
+                _frameWriter,
+                _inputFlowControl,
+                _outputFlowControl);
+            streamContext.TimeoutControl = _context.TimeoutControl;
+            streamContext.InitialExecutionContext = _context.InitialExecutionContext;
+
+            return streamContext;
+        }
+
+        private void ReturnStream(Http2Stream stream)
+        {
+            // We're conservative about what streams we can reuse.
+            // If there is a chance the stream is still in use then don't attempt to reuse it.
+            Debug.Assert(stream.CanReuse);
+
+            if (StreamPool.Count < MaxStreamPoolSize)
+            {
+                // This property is used to remove unused streams from the pool
+                stream.DrainExpirationTicks = SystemClock.UtcNowTicks + StreamPoolExpiryTicks;
+
+                StreamPool.Push(stream);
             }
         }
 
@@ -701,7 +804,16 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     }
                 }
 
-                return ackTask.AsTask();
+                // Maximum HPack encoder size is limited by Http2Limits.HeaderTableSize, configured max the server.
+                //
+                // Note that the client HPack decoder doesn't care about the ACK so we don't need to lock sending the
+                // ACK and updating the table size on the server together.
+                // The client will wait until a size agreed upon by it (sent in SETTINGS_HEADER_TABLE_SIZE) and the
+                // server (sent as a dynamic table size update in the next HEADERS frame) is received before applying
+                // the new size.
+                _frameWriter.UpdateMaxHeaderTableSize(Math.Min(_clientSettings.HeaderTableSize, (uint)Limits.Http2.HeaderTableSize));
+
+                return ackTask.GetAsTask();
             }
             catch (Http2SettingsParameterOutOfRangeException ex)
             {
@@ -728,13 +840,19 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 throw new Http2ConnectionErrorException(CoreStrings.FormatHttp2ErrorUnexpectedFrameLength(_incomingFrame.Type, 8), Http2ErrorCode.FRAME_SIZE_ERROR);
             }
 
+            // Incoming ping resets connection keep alive timeout
+            if (TimeoutControl.TimerReason == TimeoutReason.KeepAlive)
+            {
+                TimeoutControl.ResetTimeout(Limits.KeepAliveTimeout.Ticks, TimeoutReason.KeepAlive);
+            }
+
             if (_incomingFrame.PingAck)
             {
                 // TODO: verify that payload is equal to the outgoing PING frame
                 return Task.CompletedTask;
             }
 
-            return _frameWriter.WritePingAsync(Http2PingFrameFlags.ACK, payload).AsTask();
+            return _frameWriter.WritePingAsync(Http2PingFrameFlags.ACK, payload).GetAsTask();
         }
 
         private Task ProcessGoAwayFrameAsync()
@@ -859,6 +977,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         private Task DecodeHeadersAsync(bool endHeaders, in ReadOnlySequence<byte> payload)
         {
+            Debug.Assert(_currentHeadersStream != null);
+
             try
             {
                 _highestOpenedStreamId = _currentHeadersStream.StreamId;
@@ -872,6 +992,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
             catch (Http2StreamErrorException)
             {
+                _currentHeadersStream.Dispose();
                 ResetRequestHeaderParsingState();
                 throw;
             }
@@ -881,6 +1002,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         private Task DecodeTrailersAsync(bool endHeaders, in ReadOnlySequence<byte> payload)
         {
+            Debug.Assert(_currentHeadersStream != null);
+
             _hpackDecoder.Decode(payload, endHeaders, handler: this);
 
             if (endHeaders)
@@ -894,6 +1017,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         private void StartStream()
         {
+            Debug.Assert(_currentHeadersStream != null);
+
             // The stream now exists and must be tracked and drained even if Http2StreamErrorException is thrown before dispatching to the application.
             _streams[_incomingFrame.StreamId] = _currentHeadersStream;
             IncrementActiveClientStreamCount();
@@ -919,7 +1044,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     throw new Http2StreamErrorException(_currentHeadersStream.StreamId, CoreStrings.Http2ErrorMissingMandatoryPseudoHeaderFields, Http2ErrorCode.PROTOCOL_ERROR);
                 }
 
-                if (_clientActiveStreamCount > _serverSettings.MaxConcurrentStreams)
+                if (_clientActiveStreamCount == _serverSettings.MaxConcurrentStreams)
+                {
+                    // Provide feedback in server logs that the client hit the number of maximum concurrent streams,
+                    // and that the client is likely waiting for existing streams to be completed before it can continue.
+                    Log.Http2MaxConcurrentStreamsReached(_context.ConnectionId);
+                }
+                else if (_clientActiveStreamCount > _serverSettings.MaxConcurrentStreams)
                 {
                     // The protocol default stream limit is infinite so the client can exceed our limit at the start of the connection.
                     // Refused streams can be retried, by which time the client must have received our settings frame with our limit information.
@@ -929,7 +1060,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 // We don't use the _serverActiveRequestCount here as during shutdown, it and the dictionary counts get out of sync.
                 // The streams still exist in the dictionary until the client responds with a RST or END_STREAM.
                 // Also, we care about the dictionary size for too much memory consumption.
-                if (_streams.Count > _serverSettings.MaxConcurrentStreams * 2)
+                if (_streams.Count > MaxTrackedStreams)
                 {
                     // Server is getting hit hard with connection resets.
                     // Tell client to calm down.
@@ -940,11 +1071,17 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             catch (Http2StreamErrorException)
             {
                 MakeSpaceInDrainQueue();
-                // Tracked for draining
-                _completedStreams.Enqueue(_currentHeadersStream);
+
+                // Because this stream isn't being queued, OnRequestProcessingEnded will not be
+                // automatically called and the stream won't be completed.
+                // Manually complete stream to ensure pipes are completed.
+                // Completing the stream will add it to the completed stream queue.
+                _currentHeadersStream.DecrementActiveClientStreamCount();
+                _currentHeadersStream.CompleteStream(errored: true);
                 throw;
             }
 
+            KestrelEventSource.Log.RequestQueuedStart(_currentHeadersStream, AspNetCore.Http.HttpProtocol.Http2);
             // Must not allow app code to block the connection handling loop.
             ThreadPool.UnsafeQueueUserWorkItem(_currentHeadersStream, preferLocal: false);
         }
@@ -1000,7 +1137,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         private void UpdateCompletedStreams()
         {
-            Http2Stream firstRequedStream = null;
+            Http2Stream? firstRequedStream = null;
             var now = SystemClock.UtcNowTicks;
 
             while (_completedStreams.TryDequeue(out var stream))
@@ -1027,7 +1164,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                         throw new Http2ConnectionErrorException(CoreStrings.FormatHttp2ErrorStreamClosed(_incomingFrame.Type, _incomingFrame.StreamId), Http2ErrorCode.STREAM_CLOSED);
                     }
 
-                    _streams.Remove(stream.StreamId);
+                    RemoveStream(stream);
                 }
                 else
                 {
@@ -1041,10 +1178,23 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
         }
 
+        private void RemoveStream(Http2Stream stream)
+        {
+            _streams.Remove(stream.StreamId);
+            if (stream.CanReuse)
+            {
+                ReturnStream(stream);
+            }
+            else
+            {
+                stream.Dispose();
+            }
+        }
+
         // Compare to UpdateCompletedStreams, but only removes streams if over the max stream drain limit.
         private void MakeSpaceInDrainQueue()
         {
-            var maxStreams = _serverSettings.MaxConcurrentStreams * 2;
+            var maxStreams = MaxTrackedStreams;
             // If we're tracking too many streams, discard the oldest.
             while (_streams.Count >= maxStreams && _completedStreams.TryDequeue(out var stream))
             {
@@ -1053,7 +1203,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     _serverActiveStreamCount--;
                 }
 
-                _streams.Remove(stream.StreamId);
+                RemoveStream(stream);
             }
         }
 
@@ -1100,11 +1250,33 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             }
         }
 
+        public void OnHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        {
+            OnHeaderCore(index: null, indexedValue: false, name, value);
+        }
+
+        public void OnStaticIndexedHeader(int index)
+        {
+            Debug.Assert(index <= H2StaticTable.Count);
+
+            ref readonly var entry = ref H2StaticTable.Get(index - 1);
+            OnHeaderCore(index, indexedValue: true, entry.Name, entry.Value);
+        }
+
+        public void OnStaticIndexedHeader(int index, ReadOnlySpan<byte> value)
+        {
+            Debug.Assert(index <= H2StaticTable.Count);
+
+            OnHeaderCore(index, indexedValue: false, H2StaticTable.Get(index - 1).Name, value);
+        }
+
         // We can't throw a Http2StreamErrorException here, it interrupts the header decompression state and may corrupt subsequent header frames on other streams.
         // For now these either need to be connection errors or BadRequests. If we want to downgrade any of them to stream errors later then we need to
         // rework the flow so that the remaining headers are drained and the decompression state is maintained.
-        public void OnHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        private void OnHeaderCore(int? index, bool indexedValue, ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
         {
+            Debug.Assert(_currentHeadersStream != null);
+
             // https://tools.ietf.org/html/rfc7540#section-6.5.2
             // "The value is based on the uncompressed size of header fields, including the length of the name and value in octets plus an overhead of 32 octets for each header field.";
             _totalParsedHeaderSize += HeaderField.RfcOverhead + name.Length + value.Length;
@@ -1113,7 +1285,15 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 throw new Http2ConnectionErrorException(CoreStrings.BadRequest_HeadersExceedMaxTotalSize, Http2ErrorCode.PROTOCOL_ERROR);
             }
 
-            ValidateHeader(name, value);
+            if (index != null)
+            {
+                ValidateStaticHeader(index.Value, value);
+            }
+            else
+            {
+                ValidateHeader(name, value);
+            }
+
             try
             {
                 if (_requestHeaderParsingState == RequestHeaderParsingState.Trailers)
@@ -1124,10 +1304,17 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 {
                     // Throws BadRequest for header count limit breaches.
                     // Throws InvalidOperation for bad encoding.
-                    _currentHeadersStream.OnHeader(name, value);
+                    if (index != null)
+                    {
+                        _currentHeadersStream.OnHeader(index.Value, indexedValue, name, value);
+                    }
+                    else
+                    {
+                        _currentHeadersStream.OnHeader(name, value);
+                    }
                 }
             }
-            catch (BadHttpRequestException bre)
+            catch (Microsoft.AspNetCore.Http.BadHttpRequestException bre)
             {
                 throw new Http2ConnectionErrorException(bre.Message, Http2ErrorCode.PROTOCOL_ERROR);
             }
@@ -1138,9 +1325,65 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         }
 
         public void OnHeadersComplete(bool endStream)
-            => _currentHeadersStream.OnHeadersComplete();
+            => _currentHeadersStream!.OnHeadersComplete();
 
         private void ValidateHeader(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+        {
+            // Clients will normally send pseudo headers as an indexed header.
+            // Because pseudo headers can still be sent by name we need to check for them.
+            UpdateHeaderParsingState(value, GetPseudoHeaderField(name));
+
+            if (IsConnectionSpecificHeaderField(name, value))
+            {
+                throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorConnectionSpecificHeaderField, Http2ErrorCode.PROTOCOL_ERROR);
+            }
+
+            // http://httpwg.org/specs/rfc7540.html#rfc.section.8.1.2
+            // A request or response containing uppercase header field names MUST be treated as malformed (Section 8.1.2.6).
+            for (var i = 0; i < name.Length; i++)
+            {
+                if (((uint)name[i] - 65) <= (90 - 65))
+                {
+                    if (_requestHeaderParsingState == RequestHeaderParsingState.Trailers)
+                    {
+                        throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorTrailerNameUppercase, Http2ErrorCode.PROTOCOL_ERROR);
+                    }
+                    else
+                    {
+                        throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorHeaderNameUppercase, Http2ErrorCode.PROTOCOL_ERROR);
+                    }
+                }
+            }
+        }
+
+        private void ValidateStaticHeader(int index, ReadOnlySpan<byte> value)
+        {
+            var headerField = index switch
+            {
+                1 => PseudoHeaderFields.Authority,
+                2 => PseudoHeaderFields.Method,
+                3 => PseudoHeaderFields.Method,
+                4 => PseudoHeaderFields.Path,
+                5 => PseudoHeaderFields.Path,
+                6 => PseudoHeaderFields.Scheme,
+                7 => PseudoHeaderFields.Scheme,
+                8 => PseudoHeaderFields.Status,
+                9 => PseudoHeaderFields.Status,
+                10 => PseudoHeaderFields.Status,
+                11 => PseudoHeaderFields.Status,
+                12 => PseudoHeaderFields.Status,
+                13 => PseudoHeaderFields.Status,
+                14 => PseudoHeaderFields.Status,
+                _ => PseudoHeaderFields.None
+            };
+
+            UpdateHeaderParsingState(value, headerField);
+
+            // http://httpwg.org/specs/rfc7540.html#rfc.section.8.1.2
+            // No need to validate if header name if it is specified using a static index.
+        }
+
+        private void UpdateHeaderParsingState(ReadOnlySpan<byte> value, PseudoHeaderFields headerField)
         {
             // http://httpwg.org/specs/rfc7540.html#rfc.section.8.1.2.1
             /*
@@ -1156,7 +1399,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                against several types of common attacks against HTTP; they are
                deliberately strict because being permissive can expose
                implementations to these vulnerabilities.*/
-            if (IsPseudoHeaderField(name, out var headerField))
+            if (headerField != PseudoHeaderFields.None)
             {
                 if (_requestHeaderParsingState == RequestHeaderParsingState.Headers)
                 {
@@ -1206,65 +1449,38 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             {
                 _requestHeaderParsingState = RequestHeaderParsingState.Headers;
             }
-
-            if (IsConnectionSpecificHeaderField(name, value))
-            {
-                throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorConnectionSpecificHeaderField, Http2ErrorCode.PROTOCOL_ERROR);
-            }
-
-            // http://httpwg.org/specs/rfc7540.html#rfc.section.8.1.2
-            // A request or response containing uppercase header field names MUST be treated as malformed (Section 8.1.2.6).
-            for (var i = 0; i < name.Length; i++)
-            {
-                if (name[i] >= 65 && name[i] <= 90)
-                {
-                    if (_requestHeaderParsingState == RequestHeaderParsingState.Trailers)
-                    {
-                        throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorTrailerNameUppercase, Http2ErrorCode.PROTOCOL_ERROR);
-                    }
-                    else
-                    {
-                        throw new Http2ConnectionErrorException(CoreStrings.Http2ErrorHeaderNameUppercase, Http2ErrorCode.PROTOCOL_ERROR);
-                    }
-                }
-            }
         }
 
-        private bool IsPseudoHeaderField(ReadOnlySpan<byte> name, out PseudoHeaderFields headerField)
+        private PseudoHeaderFields GetPseudoHeaderField(ReadOnlySpan<byte> name)
         {
-            headerField = PseudoHeaderFields.None;
-
             if (name.IsEmpty || name[0] != (byte)':')
             {
-                return false;
+                return PseudoHeaderFields.None;
             }
-
-            if (name.SequenceEqual(PathBytes))
+            else if (name.SequenceEqual(PathBytes))
             {
-                headerField = PseudoHeaderFields.Path;
+                return PseudoHeaderFields.Path;
             }
             else if (name.SequenceEqual(MethodBytes))
             {
-                headerField = PseudoHeaderFields.Method;
+                return PseudoHeaderFields.Method;
             }
             else if (name.SequenceEqual(SchemeBytes))
             {
-                headerField = PseudoHeaderFields.Scheme;
+                return PseudoHeaderFields.Scheme;
             }
             else if (name.SequenceEqual(StatusBytes))
             {
-                headerField = PseudoHeaderFields.Status;
+                return PseudoHeaderFields.Status;
             }
             else if (name.SequenceEqual(AuthorityBytes))
             {
-                headerField = PseudoHeaderFields.Authority;
+                return PseudoHeaderFields.Authority;
             }
             else
             {
-                headerField = PseudoHeaderFields.Unknown;
+                return PseudoHeaderFields.Unknown;
             }
-
-            return true;
         }
 
         private static bool IsConnectionSpecificHeaderField(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
@@ -1295,7 +1511,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
 
         private async Task ReadInputAsync()
         {
-            Exception error = null;
+            Exception? error = null;
             try
             {
                 while (true)
@@ -1339,44 +1555,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             {
                 await _context.Transport.Input.CompleteAsync();
                 _input.Writer.Complete(error);
-            }
-        }
-
-        private class StreamCloseAwaitable : ICriticalNotifyCompletion
-        {
-            private static readonly Action _callbackCompleted = () => { };
-
-            // Initialize to completed so UpdateCompletedStreams runs at least once during connection teardown
-            // if there are still active streams.
-            private Action _callback = _callbackCompleted;
-
-            public StreamCloseAwaitable GetAwaiter() => this;
-            public bool IsCompleted => ReferenceEquals(_callback, _callbackCompleted);
-
-            public void GetResult()
-            {
-                Debug.Assert(ReferenceEquals(_callback, _callbackCompleted));
-
-                _callback = null;
-            }
-
-            public void OnCompleted(Action continuation)
-            {
-                if (ReferenceEquals(_callback, _callbackCompleted) ||
-                    ReferenceEquals(Interlocked.CompareExchange(ref _callback, continuation, null), _callbackCompleted))
-                {
-                    Task.Run(continuation);
-                }
-            }
-
-            public void UnsafeOnCompleted(Action continuation)
-            {
-                OnCompleted(continuation);
-            }
-
-            public void Complete()
-            {
-                Interlocked.Exchange(ref _callback, _callbackCompleted)?.Invoke();
             }
         }
 

@@ -4,7 +4,13 @@
 This script runs a quick check for common errors, such as checking that Visual Studio solutions are up to date or that generated code has been committed to source.
 #>
 param(
-    [switch]$ci
+    [switch]$ci,
+    # Optional arguments that enable downloading an internal
+    # runtime or runtime from a non-default location
+    [Alias('DotNetRuntimeSourceFeed')]
+    [string]$RuntimeSourceFeed,
+    [Alias('DotNetRuntimeSourceFeedKey')]
+    [string]$RuntimeSourceFeedKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +49,12 @@ function LogError {
 try {
     if ($ci) {
         # Install dotnet.exe
-        & $repoRoot/restore.cmd -ci -NoBuildNodeJS
+        if ($RuntimeSourceFeed -or $RuntimeSourceFeedKey) {
+            & $repoRoot/restore.cmd -ci -nobl -noBuildNodeJS -RuntimeSourceFeed $RuntimeSourceFeed -RuntimeSourceFeedKey $RuntimeSourceFeedKey
+        }
+        else{
+            & $repoRoot/restore.cmd -ci -nobl -noBuildNodeJS
+        }
     }
 
     . "$repoRoot/activate.ps1"
@@ -99,7 +110,7 @@ try {
         else {
             $varName = $dep.Name -replace '\.',''
             $varName = $varName -replace '\-',''
-            $varName = "${varName}PackageVersion"
+            $varName = "${varName}Version"
 
             $versionVar = $versionProps.SelectSingleNode("//PropertyGroup[`@Label=`"Automated`"]/$varName")
             $actualVersion = $versionVar.InnerText
@@ -130,7 +141,7 @@ try {
         | ? {
             # These .sln files are used by the templating engine.
             ($_.Name -ne "BlazorServerWeb_CSharp.sln") -and
-            ($_.Name -ne "BlazorWasm-CSharp.sln")
+            ($_.Name -ne "ComponentsWebAssembly-CSharp.sln")
         } `
         | % {
         Write-Host "  Checking $(Split-Path -Leaf $_)"
@@ -157,11 +168,6 @@ try {
         & $PSScriptRoot\GenerateProjectList.ps1 -ci:$ci
     }
 
-    Write-Host "Re-generating references assemblies"
-    Invoke-Block {
-        & $PSScriptRoot\GenerateReferenceAssemblies.ps1 -ci:$ci
-    }
-
     Write-Host "Re-generating package baselines"
     Invoke-Block {
         & dotnet run -p "$repoRoot/eng/tools/BaselineGenerator/"
@@ -172,12 +178,13 @@ try {
     # Redirect stderr to stdout because PowerShell does not consistently handle output to stderr
     $changedFiles = & cmd /c 'git --no-pager diff --ignore-space-change --name-only 2>nul'
 
-    # Temporary: Disable check for blazor js file
-    $changedFilesExclusion = "src/Components/Web.JS/dist/Release/blazor.server.js"
+    # Temporary: Disable check for blazor js file and nuget.config (updated automatically for
+    # internal builds)
+    $changedFilesExclusions = @("src/Components/Web.JS/dist/Release/blazor.server.js", "NuGet.config")
 
     if ($changedFiles) {
         foreach ($file in $changedFiles) {
-            if ($file -eq $changedFilesExclusion) {continue}
+            if ($changedFilesExclusions -contains $file) {continue}
             $filePath = Resolve-Path "${repoRoot}/${file}"
             LogError "Generated code is not up to date in $file. You might need to regenerate the reference assemblies or project list (see docs/ReferenceAssemblies.md and docs/ReferenceResolution.md)" -filepath $filePath
             & git --no-pager diff --ignore-space-change $filePath

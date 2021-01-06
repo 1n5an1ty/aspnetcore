@@ -268,6 +268,12 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding
             }
 
             var modelMetadata = metadataProvider.GetMetadataForType(modelType);
+
+            if (modelMetadata.BoundConstructor != null)
+            {
+                throw new NotSupportedException(Resources.FormatTryUpdateModel_RecordTypeNotSupported(nameof(TryUpdateModelAsync), modelType));
+            }
+
             var modelState = actionContext.ModelState;
 
             var modelBindingContext = DefaultModelBindingContext.CreateBindingContext(
@@ -545,8 +551,8 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding
             }
 
             // Will we be able to activate an instance and use that?
-            return modelType.GetTypeInfo().IsClass &&
-                !modelType.GetTypeInfo().IsAbstract &&
+            return modelType.IsClass &&
+                !modelType.IsAbstract &&
                 typeof(ICollection<T>).IsAssignableFrom(modelType);
         }
 
@@ -667,7 +673,7 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding
             if (value == null)
             {
                 // For value types, treat null values as though they were the default value for the type.
-                return type.GetTypeInfo().IsValueType ? Activator.CreateInstance(type) : null;
+                return type.IsValueType ? Activator.CreateInstance(type) : null;
             }
 
             if (type.IsAssignableFrom(value.GetType()))
@@ -750,7 +756,7 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding
             if (!(canConvertFrom || converter.CanConvertTo(destinationType)))
             {
                 // EnumConverter cannot convert integer, so we verify manually
-                if (destinationType.GetTypeInfo().IsEnum &&
+                if (destinationType.IsEnum &&
                     (value is int ||
                     value is uint ||
                     value is long ||

@@ -65,6 +65,9 @@ namespace Microsoft.AspNetCore.Http
             get { return _value; }
         }
 
+        /// <summary>
+        /// Returns true if the host is set.
+        /// </summary>
         public bool HasValue
         {
             get { return !string.IsNullOrEmpty(_value); }
@@ -96,7 +99,7 @@ namespace Microsoft.AspNetCore.Http
                 GetParts(_value, out var host, out var port);
 
                 if (!StringSegment.IsNullOrEmpty(port)
-                    && int.TryParse(port.ToString(), NumberStyles.None, CultureInfo.InvariantCulture, out var p))
+                    && int.TryParse(port.AsSpan(), NumberStyles.None, CultureInfo.InvariantCulture, out var p))
                 {
                     return p;
                 }
@@ -297,7 +300,7 @@ namespace Microsoft.AspNetCore.Http
         /// </summary>
         /// <param name="obj">The <see cref="object"/> to compare against.</param>
         /// <returns><see langword="true" /> if they have the same value.</returns>
-        public override bool Equals(object obj)
+        public override bool Equals(object? obj)
         {
             if (ReferenceEquals(null, obj))
             {

@@ -1,6 +1,8 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
+#nullable enable
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -12,23 +14,25 @@ namespace Microsoft.Extensions.Internal
 {
     internal class PropertyHelper
     {
+        private const BindingFlags DeclaredOnlyLookup = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+
         // Delegate type for a by-ref property getter
         private delegate TValue ByRefFunc<TDeclaringType, TValue>(ref TDeclaringType arg);
 
         private static readonly MethodInfo CallPropertyGetterOpenGenericMethod =
-            typeof(PropertyHelper).GetTypeInfo().GetDeclaredMethod(nameof(CallPropertyGetter));
+            typeof(PropertyHelper).GetMethod(nameof(CallPropertyGetter), DeclaredOnlyLookup)!;
 
         private static readonly MethodInfo CallPropertyGetterByReferenceOpenGenericMethod =
-            typeof(PropertyHelper).GetTypeInfo().GetDeclaredMethod(nameof(CallPropertyGetterByReference));
+            typeof(PropertyHelper).GetMethod(nameof(CallPropertyGetterByReference), DeclaredOnlyLookup)!;
 
         private static readonly MethodInfo CallNullSafePropertyGetterOpenGenericMethod =
-            typeof(PropertyHelper).GetTypeInfo().GetDeclaredMethod(nameof(CallNullSafePropertyGetter));
+            typeof(PropertyHelper).GetMethod(nameof(CallNullSafePropertyGetter), DeclaredOnlyLookup)!;
 
         private static readonly MethodInfo CallNullSafePropertyGetterByReferenceOpenGenericMethod =
-            typeof(PropertyHelper).GetTypeInfo().GetDeclaredMethod(nameof(CallNullSafePropertyGetterByReference));
+            typeof(PropertyHelper).GetMethod(nameof(CallNullSafePropertyGetterByReference), DeclaredOnlyLookup)!;
 
         private static readonly MethodInfo CallPropertySetterOpenGenericMethod =
-            typeof(PropertyHelper).GetTypeInfo().GetDeclaredMethod(nameof(CallPropertySetter));
+            typeof(PropertyHelper).GetMethod(nameof(CallPropertySetter), DeclaredOnlyLookup)!;
 
         // Using an array rather than IEnumerable, as target will be called on the hot path numerous times.
         private static readonly ConcurrentDictionary<Type, PropertyHelper[]> PropertiesCache =
@@ -41,18 +45,18 @@ namespace Microsoft.Extensions.Internal
         // for platforms where the attribute is not defined, like net46. So we can fetch the attribute
         // by late binding. If the attribute isn't defined, then we assume we won't encounter any
         // 'ref struct' types.
-        private static readonly Type IsByRefLikeAttribute = Type.GetType("System.Runtime.CompilerServices.IsByRefLikeAttribute", throwOnError: false);
+        private static readonly Type? IsByRefLikeAttribute = Type.GetType("System.Runtime.CompilerServices.IsByRefLikeAttribute", throwOnError: false);
 
-        private Action<object, object> _valueSetter;
-        private Func<object, object> _valueGetter;
+        private Action<object, object>? _valueSetter;
+        private Func<object, object>? _valueGetter;
 
         /// <summary>
         /// Initializes a fast <see cref="PropertyHelper"/>.
         /// This constructor does not cache the helper. For caching, use <see cref="GetProperties(Type)"/>.
         /// </summary>
         public PropertyHelper(PropertyInfo property)
-        {   
-            Property = property ?? throw new ArgumentNullException(nameof(property)); 
+        {
+            Property = property ?? throw new ArgumentNullException(nameof(property));
             Name = property.Name;
         }
 
@@ -243,7 +247,7 @@ namespace Microsoft.Extensions.Internal
             // Instance methods in the CLR can be turned into static methods where the first parameter
             // is open over "target". This parameter is always passed by reference, so we have a code
             // path for value types and a code path for reference types.
-            if (getMethod.DeclaringType.GetTypeInfo().IsValueType)
+            if (getMethod.DeclaringType!.IsValueType)
             {
                 // Create a delegate (ref TDeclaringType) -> TValue
                 return MakeFastPropertyGetter(
@@ -266,7 +270,7 @@ namespace Microsoft.Extensions.Internal
             MethodInfo propertyGetMethod,
             MethodInfo openGenericWrapperMethod)
         {
-            var typeInput = propertyGetMethod.DeclaringType;
+            var typeInput = propertyGetMethod.DeclaringType!;
             var typeOutput = propertyGetMethod.ReturnType;
 
             var delegateType = openGenericDelegateType.MakeGenericType(typeInput, typeOutput);
@@ -292,7 +296,7 @@ namespace Microsoft.Extensions.Internal
         public static Action<object, object> MakeFastPropertySetter(PropertyInfo propertyInfo)
         {
             Debug.Assert(propertyInfo != null);
-            Debug.Assert(!propertyInfo.DeclaringType.GetTypeInfo().IsValueType);
+            Debug.Assert(!propertyInfo.DeclaringType!.IsValueType);
 
             var setMethod = propertyInfo.SetMethod;
             Debug.Assert(setMethod != null);
@@ -304,7 +308,7 @@ namespace Microsoft.Extensions.Internal
             // Instance methods in the CLR can be turned into static methods where the first parameter
             // is open over "target". This parameter is always passed by reference, so we have a code
             // path for value types and a code path for reference types.
-            var typeInput = setMethod.DeclaringType;
+            var typeInput = setMethod.DeclaringType!;
             var parameterType = parameters[0].ParameterType;
 
             // Create a delegate TDeclaringType -> { TDeclaringType.Property = TValue; }
@@ -357,7 +361,7 @@ namespace Microsoft.Extensions.Internal
         }
 
         // Called via reflection
-        private static object CallPropertyGetter<TDeclaringType, TValue>(
+        private static object? CallPropertyGetter<TDeclaringType, TValue>(
             Func<TDeclaringType, TValue> getter,
             object target)
         {
@@ -365,7 +369,7 @@ namespace Microsoft.Extensions.Internal
         }
 
         // Called via reflection
-        private static object CallPropertyGetterByReference<TDeclaringType, TValue>(
+        private static object? CallPropertyGetterByReference<TDeclaringType, TValue>(
             ByRefFunc<TDeclaringType, TValue> getter,
             object target)
         {
@@ -374,7 +378,7 @@ namespace Microsoft.Extensions.Internal
         }
 
         // Called via reflection
-        private static object CallNullSafePropertyGetter<TDeclaringType, TValue>(
+        private static object? CallNullSafePropertyGetter<TDeclaringType, TValue>(
             Func<TDeclaringType, TValue> getter,
             object target)
         {
@@ -387,7 +391,7 @@ namespace Microsoft.Extensions.Internal
         }
 
         // Called via reflection
-        private static object CallNullSafePropertyGetterByReference<TDeclaringType, TValue>(
+        private static object? CallNullSafePropertyGetterByReference<TDeclaringType, TValue>(
             ByRefFunc<TDeclaringType, TValue> getter,
             object target)
         {
@@ -455,19 +459,18 @@ namespace Microsoft.Extensions.Internal
 
                 // Walk up the hierarchy until we find the type that actually declares this
                 // PropertyInfo.
-                var currentTypeInfo = type.GetTypeInfo();
-                var declaringTypeInfo = declaringType.GetTypeInfo();
-                while (currentTypeInfo != null && currentTypeInfo != declaringTypeInfo)
+                Type? currentType = type;
+                while (currentType != null && currentType != declaringType)
                 {
                     // We've found a 'more proximal' public definition
-                    var declaredProperty = currentTypeInfo.GetDeclaredProperty(propertyHelper.Name);
+                    var declaredProperty = currentType.GetProperty(propertyHelper.Name, DeclaredOnlyLookup);
                     if (declaredProperty != null)
                     {
                         ignoreProperty = true;
                         break;
                     }
 
-                    currentTypeInfo = currentTypeInfo.BaseType?.GetTypeInfo();
+                    currentType = currentType.BaseType;
                 }
 
                 if (!ignoreProperty)
@@ -495,11 +498,10 @@ namespace Microsoft.Extensions.Internal
                 // We avoid loading indexed properties using the Where statement.
                 var properties = type.GetRuntimeProperties().Where(p => IsInterestingProperty(p));
 
-                var typeInfo = type.GetTypeInfo();
-                if (typeInfo.IsInterface)
+                if (type.IsInterface)
                 {
                     // Reflection does not return information about inherited properties on the interface itself.
-                    properties = properties.Concat(typeInfo.ImplementedInterfaces.SelectMany(
+                    properties = properties.Concat(type.GetInterfaces().SelectMany(
                         interfaceType => interfaceType.GetRuntimeProperties().Where(p => IsInterestingProperty(p))));
                 }
 
@@ -527,7 +529,7 @@ namespace Microsoft.Extensions.Internal
                 property.GetMethod.GetParameters().Length == 0;
         }
 
-        // PropertyHelper can't really interact with ref-struct properties since they can't be 
+        // PropertyHelper can't really interact with ref-struct properties since they can't be
         // boxed and can't be used as generic types. We just ignore them.
         //
         // see: https://github.com/aspnet/Mvc/issues/8545

@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Security.Claims;
 using System.Threading;
@@ -37,9 +38,10 @@ namespace Microsoft.AspNetCore.SignalR.Tests
 
         public TransferFormat ActiveFormat { get; set; }
 
-        public TestClient(IHubProtocol protocol = null, IInvocationBinder invocationBinder = null, string userIdentifier = null)
+        public TestClient(IHubProtocol protocol = null, IInvocationBinder invocationBinder = null, string userIdentifier = null, long pauseWriterThreshold = 32768)
         {
-            var options = new PipeOptions(readerScheduler: PipeScheduler.Inline, writerScheduler: PipeScheduler.Inline, useSynchronizationContext: false);
+            var options = new PipeOptions(readerScheduler: PipeScheduler.Inline, writerScheduler: PipeScheduler.Inline, useSynchronizationContext: false,
+                pauseWriterThreshold: pauseWriterThreshold, resumeWriterThreshold: pauseWriterThreshold / 2);
             var pair = DuplexPipe.CreateConnectionPair(options, options);
             Connection = new DefaultConnectionContext(Guid.NewGuid().ToString(), pair.Transport, pair.Application);
 
@@ -47,7 +49,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             Connection.Features.Set<ITransferFormatFeature>(this);
             Connection.Features.Set<IConnectionHeartbeatFeature>(this);
 
-            var claimValue = Interlocked.Increment(ref _id).ToString();
+            var claimValue = Interlocked.Increment(ref _id).ToString(CultureInfo.InvariantCulture);
             var claims = new List<Claim> { new Claim(ClaimTypes.Name, claimValue) };
             if (userIdentifier != null)
             {
@@ -70,16 +72,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
         {
             if (sendHandshakeRequestMessage)
             {
-                var memoryBufferWriter = MemoryBufferWriter.Get();
-                try
-                {
-                    HandshakeProtocol.WriteRequestMessage(new HandshakeRequestMessage(_protocol.Name, _protocol.Version), memoryBufferWriter);
-                    await Connection.Application.Output.WriteAsync(memoryBufferWriter.ToArray());
-                }
-                finally
-                {
-                    MemoryBufferWriter.Return(memoryBufferWriter);
-                }
+                await Connection.Application.Output.WriteAsync(GetHandshakeRequestMessage());
             }
 
             var connection = handler.OnConnectedAsync(Connection);
@@ -194,7 +187,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
         {
             var message = new InvocationMessage(invocationId, methodName, args, streamIds);
             return SendHubMessageAsync(message);
-        } 
+        }
 
         public async Task<string> SendHubMessageAsync(HubMessage message)
         {
@@ -259,7 +252,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
                 }
                 else
                 {
-                    // read first message out of the incoming data 
+                    // read first message out of the incoming data
                     if (HandshakeProtocol.TryParseResponseMessage(ref buffer, out var responseMessage))
                     {
                         return responseMessage;
@@ -311,6 +304,20 @@ namespace Microsoft.AspNetCore.SignalR.Tests
                 {
                     handler(state);
                 }
+            }
+        }
+
+        public byte[] GetHandshakeRequestMessage()
+        {
+            var memoryBufferWriter = MemoryBufferWriter.Get();
+            try
+            {
+                HandshakeProtocol.WriteRequestMessage(new HandshakeRequestMessage(_protocol.Name, _protocol.Version), memoryBufferWriter);
+                return memoryBufferWriter.ToArray();
+            }
+            finally
+            {
+                MemoryBufferWriter.Return(memoryBufferWriter);
             }
         }
 

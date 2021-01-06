@@ -16,6 +16,7 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Binders
     /// <summary>
     /// <see cref="IModelBinder"/> implementation for binding complex types.
     /// </summary>
+    [Obsolete("This type is obsolete and will be removed in a future version. Use ComplexObjectModelBinder instead.")]
     public class ComplexTypeModelBinder : IModelBinder
     {
         // Don't want a new public enum because communication between the private and internal methods of this class
@@ -81,6 +82,7 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Binders
             _logger = loggerFactory.CreateLogger<ComplexTypeModelBinder>();
         }
 
+        /// <inheritdoc/>
         public Task BindModelAsync(ModelBindingContext bindingContext)
         {
             if (bindingContext == null)
@@ -438,7 +440,7 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Binders
         {
             // Value types have copy-by-value semantics, which prevents us from updating
             // properties that are marked readonly.
-            if (propertyType.GetTypeInfo().IsValueType)
+            if (propertyType.IsValueType)
             {
                 return false;
             }
@@ -480,8 +482,8 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Binders
                 // reflection does not provide information about the implicit parameterless constructor for a struct.
                 // This binder would eventually fail to construct an instance of the struct as the Linq's NewExpression
                 // compile fails to construct it.
-                var modelTypeInfo = bindingContext.ModelType.GetTypeInfo();
-                if (modelTypeInfo.IsAbstract || modelTypeInfo.GetConstructor(Type.EmptyTypes) == null)
+                var modelType = bindingContext.ModelType;
+                if (modelType.IsAbstract || modelType.GetConstructor(Type.EmptyTypes) == null)
                 {
                     var metadata = bindingContext.ModelMetadata;
                     switch (metadata.MetadataKind)
@@ -489,18 +491,18 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Binders
                         case ModelMetadataKind.Parameter:
                             throw new InvalidOperationException(
                                 Resources.FormatComplexTypeModelBinder_NoParameterlessConstructor_ForParameter(
-                                    modelTypeInfo.FullName,
+                                    modelType.FullName,
                                     metadata.ParameterName));
                         case ModelMetadataKind.Property:
                             throw new InvalidOperationException(
                                 Resources.FormatComplexTypeModelBinder_NoParameterlessConstructor_ForProperty(
-                                    modelTypeInfo.FullName,
+                                    modelType.FullName,
                                     metadata.PropertyName,
                                     bindingContext.ModelMetadata.ContainerType.FullName));
                         case ModelMetadataKind.Type:
                             throw new InvalidOperationException(
                                 Resources.FormatComplexTypeModelBinder_NoParameterlessConstructor_ForType(
-                                    modelTypeInfo.FullName));
+                                    modelType.FullName));
                     }
                 }
 

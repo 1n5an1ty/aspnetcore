@@ -6,12 +6,13 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Net.Http;
+using System.Net.Http.QPack;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
-using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3.QPack;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure.PipeWriterHelpers;
 
@@ -25,10 +26,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
         private readonly PipeWriter _outputWriter;
         private readonly ConnectionContext _connectionContext;
         private readonly ITimeoutControl _timeoutControl;
-        private readonly MinDataRate _minResponseDataRate;
+        private readonly MinDataRate? _minResponseDataRate;
         private readonly MemoryPool<byte> _memoryPool;
         private readonly IKestrelTrace _log;
-        private readonly Http3Frame _outgoingFrame;
+        private readonly Http3RawFrame _outgoingFrame;
         private readonly TimingPipeFlusher _flusher;
 
         // TODO update max frame size
@@ -41,7 +42,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
 
         //private int _unflushedBytes;
 
-        public Http3FrameWriter(PipeWriter output, ConnectionContext connectionContext, ITimeoutControl timeoutControl, MinDataRate minResponseDataRate, string connectionId, MemoryPool<byte> memoryPool, IKestrelTrace log)
+        public Http3FrameWriter(PipeWriter output, ConnectionContext connectionContext, ITimeoutControl timeoutControl, MinDataRate? minResponseDataRate, string connectionId, MemoryPool<byte> memoryPool, IKestrelTrace log)
         {
             _outputWriter = output;
             _connectionContext = connectionContext;
@@ -49,7 +50,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             _minResponseDataRate = minResponseDataRate;
             _memoryPool = memoryPool;
             _log = log;
-            _outgoingFrame = new Http3Frame();
+            _outgoingFrame = new Http3RawFrame();
             _flusher = new TimingPipeFlusher(_outputWriter, timeoutControl, log);
             _headerEncodingBuffer = new byte[_maxFrameSize];
         }
@@ -66,18 +67,63 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
-        // TODO actually write settings here.
-        internal Task WriteSettingsAsync(IList<Http3PeerSettings> settings)
+        internal Task WriteSettingsAsync(List<Http3PeerSetting> settings)
         {
             _outgoingFrame.PrepareSettings();
-            var buffer = _outputWriter.GetSpan(2);
 
+            // Calculate how long settings are before allocating.
+
+            var settingsLength = CalculateSettingsSize(settings);
+
+            // Call GetSpan with enough room for
+            // - One encoded length int for setting size
+            // - 1 byte for setting type
+            // - settings length
+            var buffer = _outputWriter.GetSpan(settingsLength + VariableLengthIntegerHelper.MaximumEncodedLength + 1);
+
+            // Length start at 1 for type
+            var totalLength = 1;
+
+            // Write setting type
             buffer[0] = (byte)_outgoingFrame.Type;
-            buffer[1] = 0;
+            buffer = buffer[1..];
 
-            _outputWriter.Advance(2);
+            // Write settings length
+            var settingsBytesWritten = VariableLengthIntegerHelper.WriteInteger(buffer, settingsLength);
+            buffer = buffer.Slice(settingsBytesWritten);
+
+            totalLength += settingsBytesWritten + settingsLength;
+
+            WriteSettings(settings, buffer);
+
+            // Advance pipe writer and flush
+            _outgoingFrame.Length = totalLength;
+            _outputWriter.Advance(totalLength);
 
             return _outputWriter.FlushAsync().AsTask();
+        }
+
+        internal static int CalculateSettingsSize(List<Http3PeerSetting> settings)
+        {
+            var length = 0;
+            foreach (var setting in settings)
+            {
+                length += VariableLengthIntegerHelper.GetByteCount((long)setting.Parameter);
+                length += VariableLengthIntegerHelper.GetByteCount(setting.Value);
+            }
+            return length;
+        }
+
+        internal static void WriteSettings(List<Http3PeerSetting> settings, Span<byte> destination)
+        {
+            foreach (var setting in settings)
+            {
+                var parameterLength = VariableLengthIntegerHelper.WriteInteger(destination, (long)setting.Parameter);
+                destination = destination.Slice(parameterLength);
+
+                var valueLength = VariableLengthIntegerHelper.WriteInteger(destination, (long)setting.Value);
+                destination = destination.Slice(valueLength);
+            }
         }
 
         internal Task WriteStreamIdAsync(long id)
@@ -164,6 +210,22 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
+        internal ValueTask<FlushResult> WriteGoAway(long id)
+        {
+            _outgoingFrame.PrepareGoAway();
+
+            var length = VariableLengthIntegerHelper.GetByteCount(id);
+
+            _outgoingFrame.Length = length;
+
+            WriteHeaderUnsynchronized();
+
+            var buffer = _outputWriter.GetSpan(8);
+            VariableLengthIntegerHelper.WriteInteger(buffer, id);
+            _outputWriter.Advance(length);
+            return _outputWriter.FlushAsync();
+        }
+
         private void WriteHeaderUnsynchronized()
         {
             var headerLength = WriteHeader(_outgoingFrame, _outputWriter);
@@ -172,7 +234,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             _unflushedBytes += headerLength + _outgoingFrame.Length;
         }
 
-        internal static int WriteHeader(Http3Frame frame, PipeWriter output)
+        internal static int WriteHeader(Http3RawFrame frame, PipeWriter output)
         {
             // max size of the header is 16, most likely it will be smaller.
             var buffer = output.GetSpan(16);
@@ -189,7 +251,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             return totalLength;
         }
 
-        public ValueTask<FlushResult> WriteResponseTrailers(int streamId, HttpResponseTrailers headers)
+        public ValueTask<FlushResult> WriteResponseTrailers(HttpResponseTrailers headers)
         {
             lock (_writeLock)
             {
@@ -203,7 +265,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                     _outgoingFrame.PrepareHeaders();
                     var buffer = _headerEncodingBuffer.AsSpan();
                     var done = _qpackEncoder.BeginEncode(EnumerateHeaders(headers), buffer, out var payloadLength);
-                    FinishWritingHeaders(streamId, payloadLength, done);
+                    FinishWritingHeaders(payloadLength, done);
                 }
                 catch (QPackEncodingException)
                 {
@@ -223,7 +285,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             return _flusher.FlushAsync(_minResponseDataRate, bytesWritten);
         }
 
-        public ValueTask<FlushResult> FlushAsync(IHttpOutputAborter outputAborter, CancellationToken cancellationToken)
+        public ValueTask<FlushResult> FlushAsync(IHttpOutputAborter? outputAborter, CancellationToken cancellationToken)
         {
             lock (_writeLock)
             {
@@ -239,7 +301,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
-        internal void WriteResponseHeaders(int streamId, int statusCode, IHeaderDictionary headers)
+        internal void WriteResponseHeaders(int statusCode, IHeaderDictionary headers)
         {
             lock (_writeLock)
             {
@@ -253,7 +315,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                     _outgoingFrame.PrepareHeaders();
                     var buffer = _headerEncodingBuffer.AsSpan();
                     var done = _qpackEncoder.BeginEncode(statusCode, EnumerateHeaders(headers), buffer, out var payloadLength);
-                    FinishWritingHeaders(streamId, payloadLength, done);
+                    FinishWritingHeaders(payloadLength, done);
                 }
                 catch (QPackEncodingException hex)
                 {
@@ -264,7 +326,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
-        private void FinishWritingHeaders(int streamId, int payloadLength, bool done)
+        private void FinishWritingHeaders(int payloadLength, bool done)
         {
             var buffer = _headerEncodingBuffer.AsSpan();
             _outgoingFrame.Length = payloadLength;
@@ -282,17 +344,17 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
             }
         }
 
-        public void Complete()
+        public ValueTask CompleteAsync()
         {
             lock (_writeLock)
             {
                 if (_completed)
                 {
-                    return;
+                    return default;
                 }
 
                 _completed = true;
-                _outputWriter.Complete();
+                return _outputWriter.CompleteAsync();
             }
         }
 
@@ -308,7 +370,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http3
                 _aborted = true;
                 _connectionContext.Abort(error);
 
-                Complete();
+                if (_completed)
+                {
+                    return;
+                }
+
+                _completed = true;
+                _outputWriter.Complete();
             }
         }
 

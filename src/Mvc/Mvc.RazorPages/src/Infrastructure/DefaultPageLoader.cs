@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
@@ -11,7 +11,6 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.ApplicationModels;
 using Microsoft.AspNetCore.Mvc.Filters;
-using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.AspNetCore.Mvc.Razor.Compilation;
 using Microsoft.AspNetCore.Mvc.Routing;
 using Microsoft.Extensions.Options;
@@ -20,23 +19,19 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Infrastructure
 {
     internal class DefaultPageLoader : PageLoader
     {
-        private readonly IActionDescriptorCollectionProvider _collectionProvider;
         private readonly IPageApplicationModelProvider[] _applicationModelProviders;
         private readonly IViewCompilerProvider _viewCompilerProvider;
         private readonly ActionEndpointFactory _endpointFactory;
         private readonly PageConventionCollection _conventions;
         private readonly FilterCollection _globalFilters;
-        private volatile InnerCache _currentCache;
 
         public DefaultPageLoader(
-            IActionDescriptorCollectionProvider actionDescriptorCollectionProvider,
             IEnumerable<IPageApplicationModelProvider> applicationModelProviders,
             IViewCompilerProvider viewCompilerProvider,
             ActionEndpointFactory endpointFactory,
             IOptions<RazorPagesOptions> pageOptions,
             IOptions<MvcOptions> mvcOptions)
         {
-            _collectionProvider = actionDescriptorCollectionProvider;
             _applicationModelProviders = applicationModelProviders
                 .OrderBy(p => p.Order)
                 .ToArray();
@@ -49,40 +44,27 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Infrastructure
 
         private IViewCompiler Compiler => _viewCompilerProvider.GetCompiler();
 
-        private ConcurrentDictionary<PageActionDescriptor, Task<CompiledPageActionDescriptor>> CurrentCache
-        {
-            get
-            {
-                var current = _currentCache;
-                var actionDescriptors = _collectionProvider.ActionDescriptors;
-
-                if (current == null || current.Version != actionDescriptors.Version)
-                {
-                    current = new InnerCache(actionDescriptors.Version);
-                    _currentCache = current;
-                }
-
-                return current.Entries;
-            }
-        }
-
         public override Task<CompiledPageActionDescriptor> LoadAsync(PageActionDescriptor actionDescriptor)
+            => LoadAsync(actionDescriptor, EndpointMetadataCollection.Empty);
+
+        internal Task<CompiledPageActionDescriptor> LoadAsync(PageActionDescriptor actionDescriptor, EndpointMetadataCollection endpointMetadata)
         {
             if (actionDescriptor == null)
             {
                 throw new ArgumentNullException(nameof(actionDescriptor));
             }
 
-            var cache = CurrentCache;
-            if (cache.TryGetValue(actionDescriptor, out var compiledDescriptorTask))
+            var task = actionDescriptor.CompiledPageActionDescriptorTask;
+
+            if (task != null)
             {
-                return compiledDescriptorTask;
+                return task;
             }
 
-            return cache.GetOrAdd(actionDescriptor, LoadAsyncCore(actionDescriptor));
+            return actionDescriptor.CompiledPageActionDescriptorTask = LoadAsyncCore(actionDescriptor, endpointMetadata);
         }
 
-        private async Task<CompiledPageActionDescriptor> LoadAsyncCore(PageActionDescriptor actionDescriptor)
+        private async Task<CompiledPageActionDescriptor> LoadAsyncCore(PageActionDescriptor actionDescriptor, EndpointMetadataCollection endpointMetadata)
         {
             var viewDescriptor = await Compiler.CompileAsync(actionDescriptor.RelativePath);
             var context = new PageApplicationModelProviderContext(actionDescriptor, viewDescriptor.Type.GetTypeInfo());
@@ -110,7 +92,18 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Infrastructure
                 routeNames: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
                 action: compiled,
                 routes: Array.Empty<ConventionalRouteEntry>(),
-                conventions: Array.Empty<Action<EndpointBuilder>>(),
+                conventions: new Action<EndpointBuilder>[]
+                {
+                    b =>
+                    {
+                        // Metadata from PageActionDescriptor is less significant than the one discovered from the compiled type.
+                        // Consequently, we'll insert it at the beginning.
+                        for (var i = endpointMetadata.Count - 1; i >=0; i--)
+                        {
+                            b.Metadata.Insert(0, endpointMetadata[i]);
+                        }
+                    },
+                },
                 createInertEndpoints: false);
 
             // In some test scenarios there's no route so the endpoint isn't created. This is fine because
@@ -167,19 +160,6 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Infrastructure
                     conventions.OfType<TConvention>(),
                     attributes.OfType<TConvention>());
             }
-        }
-
-        private sealed class InnerCache
-        {
-            public InnerCache(int version)
-            {
-                Version = version;
-                Entries = new ConcurrentDictionary<PageActionDescriptor, Task<CompiledPageActionDescriptor>>();
-            }
-
-            public ConcurrentDictionary<PageActionDescriptor, Task<CompiledPageActionDescriptor>> Entries { get; }
-
-            public int Version { get; }
         }
     }
 }

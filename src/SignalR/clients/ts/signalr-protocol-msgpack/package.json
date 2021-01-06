@@ -7,6 +7,7 @@
   "typings": "./dist/esm/index.d.ts",
   "umd": "./dist/browser/signalr-protocol-msgpack.js",
   "umd_name": "signalR.protocols.msgpack",
+  "unpkg": "./dist/browser/signalr-protocol-msgpack.js",
   "directories": {
     "test": "spec"
   },
@@ -46,7 +47,6 @@
     "msgpack5": "^4.0.2"
   },
   "devDependencies": {
-    "@types/msgpack5": "^3.4.1",
-    "buffer": "^5.0.8"
+    "@types/msgpack5": "^3.4.1"
   }
 }

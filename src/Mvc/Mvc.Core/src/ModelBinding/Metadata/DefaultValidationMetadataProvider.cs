@@ -45,12 +45,17 @@ namespace Microsoft.AspNetCore.Mvc.ModelBinding.Metadata
                 {
                     // No IPropertyValidationFilter attributes on the property.
                     // Check if container has such an attribute.
-                    validationFilter = context.Key.ContainerType.GetTypeInfo()
+                    validationFilter = context.Key.ContainerType
                         .GetCustomAttributes(inherit: true)
                         .OfType<IPropertyValidationFilter>()
                         .FirstOrDefault();
                 }
 
+                context.ValidationMetadata.PropertyValidationFilter = validationFilter;
+            }
+            else if (context.Key.MetadataKind == ModelMetadataKind.Parameter)
+            {
+                var validationFilter = context.ParameterAttributes.OfType<IPropertyValidationFilter>().FirstOrDefault();
                 context.ValidationMetadata.PropertyValidationFilter = validationFilter;
             }
         }

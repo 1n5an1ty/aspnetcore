@@ -4,6 +4,7 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Web;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
@@ -68,7 +69,7 @@ namespace Microsoft.AspNetCore.Hosting
                 // Scope may be relevant for a different level of logging, so we always create it
                 // see: https://github.com/aspnet/Hosting/pull/944
                 // Scope can be null if logging is not on.
-                context.Scope = _logger.RequestScope(httpContext, context.Activity);
+                context.Scope = _logger.RequestScope(httpContext);
 
                 if (_logger.IsEnabled(LogLevel.Information))
                 {
@@ -85,7 +86,7 @@ namespace Microsoft.AspNetCore.Hosting
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void RequestEnd(HttpContext httpContext, Exception exception, HostingApplication.Context context)
+        public void RequestEnd(HttpContext httpContext, Exception? exception, HostingApplication.Context context)
         {
             // Local cache items resolved multiple items, in order of use so they are primed in cpu pipeline when used
             var startTimestamp = context.StartTimestamp;
@@ -170,7 +171,7 @@ namespace Microsoft.AspNetCore.Hosting
         private void LogRequestStarting(HostingApplication.Context context)
         {
             // IsEnabled is checked in the caller, so if we are here just log
-            var startLog = new HostingRequestStartingLog(context.HttpContext);
+            var startLog = new HostingRequestStartingLog(context.HttpContext!);
             context.StartLog = startLog;
 
             _logger.Log(
@@ -265,15 +266,19 @@ namespace Microsoft.AspNetCore.Hosting
 
                 // We expect baggage to be empty by default
                 // Only very advanced users will be using it in near future, we encourage them to keep baggage small (few items)
-                string[] baggage = headers.GetCommaSeparatedValues(HeaderNames.CorrelationContext);
-                if (baggage.Length > 0)
+                var baggage = headers.GetCommaSeparatedValues(HeaderNames.Baggage);
+                if (baggage.Length == 0)
                 {
-                    foreach (var item in baggage)
+                    baggage = headers.GetCommaSeparatedValues(HeaderNames.CorrelationContext);
+                }
+
+                // AddBaggage adds items at the beginning  of the list, so we need to add them in reverse to keep the same order as the client
+                // An order could be important if baggage has two items with the same key (that is allowed by the contract)
+                for (var i = baggage.Length - 1; i >= 0; i--)
+                {
+                    if (NameValueHeaderValue.TryParse(baggage[i], out var baggageItem))
                     {
-                        if (NameValueHeaderValue.TryParse(item, out var baggageItem))
-                        {
-                            activity.AddBaggage(baggageItem.Name.ToString(), baggageItem.Value.ToString());
-                        }
+                        activity.AddBaggage(baggageItem.Name.ToString(), HttpUtility.UrlDecode(baggageItem.Value.ToString()));
                     }
                 }
             }

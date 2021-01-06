@@ -4,9 +4,9 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
@@ -27,7 +27,7 @@ namespace Microsoft.AspNetCore.Hosting.StaticWebAssets
     // <<mylibrarypath>>\wwwroot\** to _content/mylibrary/**
     internal class StaticWebAssetsFileProvider : IFileProvider
     {
-        private static readonly StringComparison FilePathComparison = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ?
+        private static readonly StringComparison FilePathComparison = OperatingSystem.IsWindows() ?
             StringComparison.OrdinalIgnoreCase :
             StringComparison.Ordinal;
 
@@ -45,6 +45,11 @@ namespace Microsoft.AspNetCore.Hosting.StaticWebAssets
         public IDirectoryContents GetDirectoryContents(string subpath)
         {
             var modifiedSub = NormalizePath(subpath);
+
+            if (BasePath == "/")
+            {
+                return InnerProvider.GetDirectoryContents(modifiedSub);
+            }
 
             if (StartsWithBasePath(modifiedSub, out var physicalPath))
             {
@@ -67,6 +72,11 @@ namespace Microsoft.AspNetCore.Hosting.StaticWebAssets
         {
             var modifiedSub = NormalizePath(subpath);
 
+            if (BasePath == "/")
+            {
+                return InnerProvider.GetFileInfo(subpath);
+            }
+
             if (!StartsWithBasePath(modifiedSub, out var physicalPath))
             {
                 return new NotFoundFileInfo(subpath);
@@ -86,7 +96,7 @@ namespace Microsoft.AspNetCore.Hosting.StaticWebAssets
         private static string NormalizePath(string path)
         {
             path = path.Replace('\\', '/');
-            return path != null && path.StartsWith("/") ? path : "/" + path;
+            return path.StartsWith('/') ? path : "/" + path;
         }
 
         private bool StartsWithBasePath(string subpath, out PathString rest)
@@ -101,7 +111,7 @@ namespace Microsoft.AspNetCore.Hosting.StaticWebAssets
             public StaticWebAssetsDirectoryRoot(PathString remainingPath)
             {
                 // We MUST use the Value property here because it is unescaped.
-                _nextSegment = remainingPath.Value.Split("/", StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                _nextSegment = remainingPath.Value?.Split("/", StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
             }
 
             public bool Exists => true;

@@ -3,8 +3,8 @@
   <PropertyGroup>
     <Description>Tests for users to verify their own implementations of SignalR types</Description>
     <TargetFramework>$(DefaultNetCoreTargetFramework)</TargetFramework>
-    <IsShippingPackage>true</IsShippingPackage>
-    <HasReferenceAssembly>false</HasReferenceAssembly>
+    <IsPackable>true</IsPackable>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,6 +23,8 @@
     <Reference Include="Microsoft.AspNetCore.SignalR.Protocols.NewtonsoftJson" />
     <Reference Include="xunit.assert" />
     <Reference Include="xunit.extensibility.core" />
+    <!-- Avoid CS1705 errors due to mix of assemblies brought in transitively. -->
+    <Reference Include="Microsoft.AspNetCore.SignalR.Common" />
   </ItemGroup>
 
 </Project>

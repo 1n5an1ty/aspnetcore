@@ -5,13 +5,17 @@
 // tslint:disable:no-floating-promises
 
 import { HttpTransportType, IHttpConnectionOptions, TransferFormat } from "@microsoft/signalr";
-import { eachHttpClient, eachTransport, ECHOENDPOINT_URL } from "./Common";
+import { DEFAULT_TIMEOUT_INTERVAL, eachHttpClient, eachTransport, ECHOENDPOINT_URL, ENDPOINT_BASE_URL, HTTPS_ECHOENDPOINT_URL, shouldRunHttpsTests } from "./Common";
 import { TestLogger } from "./TestLogger";
 
 // We want to continue testing HttpConnection, but we don't export it anymore. So just pull it in directly from the source file.
 import { HttpConnection } from "@microsoft/signalr/dist/esm/HttpConnection";
 import { Platform } from "@microsoft/signalr/dist/esm/Utils";
 import "./LogBannerReporter";
+
+jasmine.DEFAULT_TIMEOUT_INTERVAL = DEFAULT_TIMEOUT_INTERVAL;
+
+const USED_ECHOENDPOINT_URL = shouldRunHttpsTests ? HTTPS_ECHOENDPOINT_URL : ECHOENDPOINT_URL;
 
 const commonOptions: IHttpConnectionOptions = {
     logMessageContent: true,
@@ -21,7 +25,7 @@ const commonOptions: IHttpConnectionOptions = {
 describe("connection", () => {
     it("can connect to the server without specifying transport explicitly", (done) => {
         const message = "Hello World!";
-        const connection = new HttpConnection(ECHOENDPOINT_URL, {
+        const connection = new HttpConnection(USED_ECHOENDPOINT_URL, {
             ...commonOptions,
         });
 
@@ -51,7 +55,7 @@ describe("connection", () => {
                     const message = "Hello World!";
                     // the url should be resolved relative to the document.location.host
                     // and the leading '/' should be automatically added to the url
-                    const connection = new HttpConnection(ECHOENDPOINT_URL, {
+                    const connection = new HttpConnection(USED_ECHOENDPOINT_URL, {
                         ...commonOptions,
                         httpClient,
                         transport: transportType,
@@ -81,7 +85,7 @@ describe("connection", () => {
                     const message = "Hello World!";
 
                     // DON'T use commonOptions because we want to specifically test the scenario where logMessageContent is not set.
-                    const connection = new HttpConnection(ECHOENDPOINT_URL, {
+                    const connection = new HttpConnection(USED_ECHOENDPOINT_URL, {
                         httpClient,
                         logger: TestLogger.instance,
                         transport: transportType,
@@ -117,7 +121,7 @@ describe("connection", () => {
                     const message = "Hello World!";
 
                     // DON'T use commonOptions because we want to specifically test the scenario where logMessageContent is set to true (even if commonOptions changes).
-                    const connection = new HttpConnection(ECHOENDPOINT_URL, {
+                    const connection = new HttpConnection(USED_ECHOENDPOINT_URL, {
                         httpClient,
                         logMessageContent: true,
                         logger: TestLogger.instance,
@@ -159,13 +163,13 @@ describe("connection", () => {
                 if (!Platform.isNode && transportType !== HttpTransportType.WebSockets &&
                     // tests run through karma during automation which is cross-site, but manually running the server will result in these tests failing
                     // so we check for cross-site
-                    !(window && ECHOENDPOINT_URL.match(`^${window.location.href}`))) {
+                    !(window && window.location.href.match(`^${ENDPOINT_BASE_URL}`))) {
                     it("honors withCredentials flag", (done) => {
                         TestLogger.saveLogsAndReset();
                         const message = "Hello World!";
 
                         // The server will set some response headers for the '/negotiate' endpoint
-                        const connection = new HttpConnection(ECHOENDPOINT_URL, {
+                        const connection = new HttpConnection(USED_ECHOENDPOINT_URL, {
                             ...commonOptions,
                             httpClient,
                             transport: transportType,
@@ -189,6 +193,36 @@ describe("connection", () => {
                         });
                     });
                 }
+            });
+        });
+    });
+
+    eachHttpClient((httpClient) => {
+        describe(`with ${(httpClient.constructor as any).name}`, () => {
+            it("follows HTTP redirects", (done) => {
+                const message = "Hello World!";
+                const connection = new HttpConnection(USED_ECHOENDPOINT_URL + "redirect", {
+                    ...commonOptions,
+                    httpClient,
+                });
+
+                connection.onreceive = async (data: any) => {
+                    if (data === message) {
+                        connection.stop();
+                    }
+                };
+
+                connection.onclose = (error: any) => {
+                    expect(error).toBeUndefined();
+                    done();
+                };
+
+                connection.start(TransferFormat.Text).then(() => {
+                    connection.send(message);
+                }).catch((e) => {
+                    fail(e);
+                    done();
+                });
             });
         });
     });

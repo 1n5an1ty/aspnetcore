@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <Description>ASP.NET Core MVC features that enable globalization and localization of applications.
@@ -9,7 +9,7 @@ Microsoft.AspNetCore.Mvc.Localization.IViewLocalizer</Description>
     <IsAspNetCoreApp>true</IsAspNetCoreApp>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <PackageTags>aspnetcore;aspnetcoremvc;localization</PackageTags>
-    <IsShippingPackage>false</IsShippingPackage>
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>

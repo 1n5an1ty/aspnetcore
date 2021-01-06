@@ -14,6 +14,9 @@ using Microsoft.Net.Http.Headers;
 
 namespace Microsoft.AspNetCore.ResponseCaching
 {
+    /// <summary>
+    /// Enable HTTP response caching.
+    /// </summary>
     public class ResponseCachingMiddleware
     {
         private static readonly TimeSpan DefaultExpirationTimeSpan = TimeSpan.FromSeconds(10);
@@ -29,6 +32,13 @@ namespace Microsoft.AspNetCore.ResponseCaching
         private readonly IResponseCache _cache;
         private readonly IResponseCachingKeyProvider _keyProvider;
 
+        /// <summary>
+        /// Creates a new <see cref="ResponseCachingMiddleware"/>.
+        /// </summary>
+        /// <param name="next">The <see cref="RequestDelegate"/> representing the next middleware in the pipeline.</param>
+        /// <param name="options">The options for this middleware.</param>
+        /// <param name="loggerFactory">The <see cref="ILoggerFactory"/> used for logging.</param>
+        /// <param name="poolProvider">The <see cref="ObjectPoolProvider"/> used for creating <see cref="ObjectPool"/> instances.</param>
         public ResponseCachingMiddleware(
             RequestDelegate next,
             IOptions<ResponseCachingOptions> options,
@@ -88,6 +98,11 @@ namespace Microsoft.AspNetCore.ResponseCaching
             _keyProvider = keyProvider;
         }
 
+        /// <summary>
+        /// Invokes the logic of the middleware.
+        /// </summary>
+        /// <param name="httpContext">The <see cref="HttpContext"/>.</param>
+        /// <returns>A <see cref="Task"/> that completes when the middleware has completed processing.</returns>
         public async Task Invoke(HttpContext httpContext)
         {
             var context = new ResponseCachingContext(httpContext, _logger);
@@ -139,7 +154,7 @@ namespace Microsoft.AspNetCore.ResponseCaching
             }
         }
 
-        internal async Task<bool> TryServeCachedResponseAsync(ResponseCachingContext context, IResponseCacheEntry cacheEntry)
+        internal async Task<bool> TryServeCachedResponseAsync(ResponseCachingContext context, IResponseCacheEntry? cacheEntry)
         {
             if (!(cacheEntry is CachedResponse cachedResponse))
             {
@@ -263,7 +278,7 @@ namespace Microsoft.AspNetCore.ResponseCaching
                 var varyQueryKeys = new StringValues(context.HttpContext.Features.Get<IResponseCachingFeature>()?.VaryByQueryKeys);
                 context.CachedResponseValidFor = context.ResponseSharedMaxAge ??
                     context.ResponseMaxAge ??
-                    (context.ResponseExpires - context.ResponseTime.Value) ??
+                    (context.ResponseExpires - context.ResponseTime!.Value) ??
                     DefaultExpirationTimeSpan;
 
                 // Generate a base key if none exist
@@ -302,7 +317,7 @@ namespace Microsoft.AspNetCore.ResponseCaching
                 // Ensure date header is set
                 if (!context.ResponseDate.HasValue)
                 {
-                    context.ResponseDate = context.ResponseTime.Value;
+                    context.ResponseDate = context.ResponseTime!.Value;
                     // Setting the date on the raw response headers.
                     context.HttpContext.Response.Headers[HeaderNames.Date] = HeaderUtilities.FormatDate(context.ResponseDate.Value);
                 }
@@ -420,7 +435,7 @@ namespace Microsoft.AspNetCore.ResponseCaching
         }
 
         internal static void RemoveResponseCachingFeature(HttpContext context) =>
-            context.Features.Set<IResponseCachingFeature>(null);
+            context.Features.Set<IResponseCachingFeature?>(null);
 
         internal static void UnshimResponseStream(ResponseCachingContext context)
         {
@@ -445,10 +460,9 @@ namespace Microsoft.AspNetCore.ResponseCaching
                 }
 
                 EntityTagHeaderValue eTag;
-                IList<EntityTagHeaderValue> ifNoneMatchEtags;
                 if (!StringValues.IsNullOrEmpty(cachedResponseHeaders[HeaderNames.ETag])
                     && EntityTagHeaderValue.TryParse(cachedResponseHeaders[HeaderNames.ETag].ToString(), out eTag)
-                    && EntityTagHeaderValue.TryParseList(ifNoneMatchHeader, out ifNoneMatchEtags))
+                    && EntityTagHeaderValue.TryParseList(ifNoneMatchHeader, out var ifNoneMatchEtags))
                 {
                     for (var i = 0; i < ifNoneMatchEtags.Count; i++)
                     {
